@@ -323,14 +323,44 @@ func main() {
 
 type Config struct {
     // ... (既存フィールド)
-    RedisURL string  // 追加
+
+    // Redis configuration components
+    RedisHost     string
+    RedisPort     int
+    RedisPassword string
+    RedisDB       int
+    RedisURL      string  // Constructed or explicitly provided
 }
 
 func loadConfig() *Config {
-    return &Config{
+    cfg := &Config{
         // ... (既存設定)
-        RedisURL: getEnv("REDIS_URL", ""),  // 追加
+
+        // Redis components (password auto-loaded from secrets)
+        RedisHost:     getEnv("REDIS_HOST", "redis"),
+        RedisPort:     getEnvInt("REDIS_PORT", 6379),
+        RedisPassword: getSecretOrEnv("REDIS_PASSWORD", ""),
+        RedisDB:       getEnvInt("REDIS_DB", 0),
     }
+
+    // REDIS_URL priority:
+    // 1. Explicit REDIS_URL environment variable (if provided)
+    // 2. Constructed from components
+    if redisURL := getEnv("REDIS_URL", ""); redisURL != "" {
+        cfg.RedisURL = redisURL
+    } else {
+        cfg.RedisURL = buildRedisURL(cfg.RedisHost, cfg.RedisPort, cfg.RedisPassword, cfg.RedisDB)
+    }
+
+    return cfg
+}
+
+// buildRedisURL constructs Redis connection string from components
+func buildRedisURL(host string, port int, password string, db int) string {
+    if password != "" {
+        return fmt.Sprintf("redis://:%s@%s:%d/%d", password, host, port, db)
+    }
+    return fmt.Sprintf("redis://%s:%d/%d", host, port, db)
 }
 ```
 
@@ -345,8 +375,9 @@ services:
     image: redis:7-alpine
     container_name: zaim-redis
     restart: unless-stopped
-
-    command: redis-server --requirepass ${REDIS_PASSWORD}
+    secrets:
+      - redis_password
+    command: sh -c 'redis-server --requirepass "$$(cat /run/secrets/redis_password)"'
 
     volumes:
       - redis-data:/data
@@ -355,7 +386,7 @@ services:
       - internal
 
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "sh", "-c", "redis-cli -a $$(cat /run/secrets/redis_password) --raw incr ping"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -365,12 +396,19 @@ services:
   # ========================================
   zaim-exporter:
     image: zaim-exporter:latest
+    secrets:
+      - encryption_key
+      - redis_password
     # replicas でスケールアウト可能
     deploy:
       replicas: 2  # 2インスタンス
 
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      # Redis components (REDIS_URL auto-constructed by Go code)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      # REDIS_PASSWORD automatically read from /run/secrets/redis_password
       # ... (既存環境変数)
 
     depends_on:
@@ -758,8 +796,8 @@ services:
   zaim-exporter:
     build: .
     environment:
-      - REDIS_URL=  # 空 (メモリ使用)
-      - ENCRYPTION_KEY=  # 空 (平文保存)
+      # No Redis (uses in-memory storage)
+      # No encryption (plaintext)
     volumes:
       - ./data:/data
 ```
@@ -771,13 +809,21 @@ services:
 services:
   redis:
     image: redis:7-alpine
+    secrets:
+      - redis_password
+    command: sh -c 'redis-server --requirepass "$$(cat /run/secrets/redis_password)"'
 
   zaim-exporter:
     deploy:
       replicas: 2
+    secrets:
+      - encryption_key
+      - redis_password
     environment:
-      - REDIS_URL=redis://:password@redis:6379/0
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}  # .env から
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      # REDIS_PASSWORD & ENCRYPTION_KEY from secrets
 ```
 
 ### 本番環境
@@ -787,7 +833,9 @@ services:
 services:
   redis:
     image: redis:7-alpine
-    command: redis-server --requirepass ${REDIS_PASSWORD}
+    secrets:
+      - redis_password
+    command: sh -c 'redis-server --requirepass "$$(cat /run/secrets/redis_password)"'
     volumes:
       - redis-data:/data
     deploy:
@@ -804,9 +852,12 @@ services:
           memory: 128M
     secrets:
       - encryption_key
+      - redis_password
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
-      # ENCRYPTION_KEY は /run/secrets/encryption_key から自動読み込み (getSecretOrEnv 関数)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      # ENCRYPTION_KEY & REDIS_PASSWORD automatically read from /run/secrets/ (getSecretOrEnv function)
 ```
 
 ---

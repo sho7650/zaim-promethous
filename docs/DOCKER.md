@@ -170,8 +170,9 @@ services:
     image: redis:7-alpine
     container_name: zaim-redis
     restart: unless-stopped
-
-    command: redis-server --requirepass ${REDIS_PASSWORD}
+    secrets:
+      - redis_password
+    command: sh -c 'redis-server --requirepass "$$(cat /run/secrets/redis_password)"'
 
     volumes:
       - redis-data:/data
@@ -179,18 +180,12 @@ services:
     networks:
       - internal
 
-    # ヘルスチェック（sh -c で環境変数を展開）
+    # ヘルスチェック（Docker Secrets 対応）
     healthcheck:
-      test: ["CMD", "sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping"]
+      test: ["CMD", "sh", "-c", "redis-cli -a $$(cat /run/secrets/redis_password) --raw incr ping"]
       interval: 10s
       timeout: 3s
       retries: 3
-
-    # 代替案: REDISCLI_AUTH 環境変数を使用する方法
-    # environment:
-    #   - REDISCLI_AUTH=${REDIS_PASSWORD}
-    # healthcheck:
-    #   test: ["CMD", "redis-cli", "ping"]
 
   # ========================================
   # Zaim Prometheus Exporter
@@ -198,6 +193,9 @@ services:
   zaim-exporter:
     image: zaim-exporter:latest
     restart: unless-stopped
+    secrets:
+      - encryption_key
+      - redis_password
 
     # スケールアウト可能
     deploy:
@@ -209,8 +207,14 @@ services:
       - ZAIM_CONSUMER_SECRET=${ZAIM_CONSUMER_SECRET}
       - ZAIM_CALLBACK_URL=https://zaim.yourdomain.com/zaim/auth/callback
       - TOKEN_FILE=/data/oauth_tokens.json
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+
+      # Redis components (REDIS_URL auto-constructed by Go code)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      # REDIS_PASSWORD automatically read from /run/secrets/redis_password
+      # ENCRYPTION_KEY automatically read from /run/secrets/encryption_key
+
       - PORT=8080
       - TZ=Asia/Tokyo
 
@@ -285,6 +289,15 @@ networks:
     external: true  # 既存の Traefik ネットワーク
   internal:
     internal: true  # Redis, Prometheus との内部通信
+
+# ========================================
+# Secrets
+# ========================================
+secrets:
+  encryption_key:
+    external: true
+  redis_password:
+    external: true
 ```
 
 ### .env.example
@@ -352,22 +365,43 @@ services:
     secrets:
       - redis_password
     command: sh -c 'redis-server --requirepass "$$(cat /run/secrets/redis_password)"'
-    # ... 他の設定 ...
+    healthcheck:
+      test: ["CMD", "sh", "-c", "redis-cli -a $$(cat /run/secrets/redis_password) --raw incr ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - redis-data:/data
+    networks:
+      - internal
 
   zaim-exporter:
     image: zaim-exporter:latest
     secrets:
       - encryption_key
       - redis_password
-    entrypoint: ["/docker-entrypoint.sh"]
-    command: ["/app/zaim-exporter"]
     environment:
       - ZAIM_CONSUMER_KEY=${ZAIM_CONSUMER_KEY}
       - ZAIM_CONSUMER_SECRET=${ZAIM_CONSUMER_SECRET}
       - ZAIM_CALLBACK_URL=https://zaim.yourdomain.com/zaim/auth/callback
-      # ENCRYPTION_KEY は /run/secrets/encryption_key から自動読み込み
-      # REDIS_URL は entrypoint スクリプトで /run/secrets/redis_password から構築
-    # ... 他の設定 ...
+
+      # Redis components (REDIS_URL auto-constructed from these)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      # REDIS_PASSWORD automatically read from /run/secrets/redis_password
+
+      # Secrets (auto-loaded by getSecretOrEnv)
+      # - ENCRYPTION_KEY (from /run/secrets/encryption_key)
+      # - REDIS_PASSWORD (from /run/secrets/redis_password)
+    volumes:
+      - zaim-tokens:/data
+    networks:
+      - traefik
+      - internal
+    depends_on:
+      redis:
+        condition: service_healthy
 
 secrets:
   encryption_key:
@@ -376,31 +410,10 @@ secrets:
     external: true
 ```
 
-**注意**: アプリケーションコードは `/run/secrets/encryption_key` を自動的に読み込みます (getSecretOrEnv 関数)。
-
-#### Entrypoint スクリプト (`docker-entrypoint.sh`)
-
-Docker Secrets から `REDIS_URL` を構築するための entrypoint スクリプトが必要です：
-
-```bash
-#!/bin/sh
-set -e
-
-# Docker Secrets から環境変数を構築
-if [ -f /run/secrets/redis_password ]; then
-    export REDIS_PASSWORD=$(cat /run/secrets/redis_password)
-    export REDIS_URL="redis://:${REDIS_PASSWORD}@redis:6379/0"
-fi
-
-# アプリケーションを実行
-exec "$@"
-```
-
-**Dockerfile に追加**:
-```dockerfile
-COPY docker-entrypoint.sh /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
-```
+**注意**:
+- アプリケーションコードは `/run/secrets/encryption_key` と `/run/secrets/redis_password` を自動的に読み込みます (getSecretOrEnv 関数)
+- `REDIS_URL` は Go コード内で自動的に構築されます (REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB から)
+- Entrypoint スクリプトは不要です (Go-based configuration)
 
 ### セットアップ手順
 
@@ -694,6 +707,84 @@ docker-compose up -d
 docker image prune -f
 ```
 
+## 統合テストプラン
+
+### 前提条件
+
+```bash
+# Docker secrets 作成
+echo "test_redis_password_123" | docker secret create redis_password -
+echo "32_byte_encryption_key_here_xxx" | docker secret create encryption_key -
+
+# .env ファイル作成
+cat > .env <<EOF
+ZAIM_CONSUMER_KEY=your_consumer_key
+ZAIM_CONSUMER_SECRET=your_consumer_secret
+EOF
+```
+
+### テストシナリオ
+
+#### Test 1: ビルドテスト
+
+```bash
+# Go コードのコンパイル（strings import 修正後）
+cd /path/to/zaim-prometheus-exporter
+go build -o /tmp/zaim-exporter ./cmd/exporter
+
+# 期待: エラーなく完了
+echo $?  # 0
+```
+
+#### Test 2: Redis ヘルスチェックテスト
+
+```bash
+# Redis のみ起動
+docker-compose up -d redis
+
+# 30秒待機（ヘルスチェックが実行されるまで）
+sleep 30
+
+# ヘルスチェック状態確認
+docker-compose ps redis
+# 期待: State が "Up (healthy)"
+
+# ヘルスチェックログ確認
+docker-compose logs redis | grep -i "noauth"
+# 期待: "NOAUTH" エラーが無いこと
+```
+
+#### Test 3: アプリケーション起動テスト
+
+```bash
+# 全サービス起動
+docker-compose up -d
+
+# 起動ログ確認
+docker-compose logs zaim-exporter | grep -i error
+# 期待: Redis 関連のエラーが無いこと
+
+# Redis 接続確認
+docker-compose logs zaim-exporter | grep -i "connected to redis"
+# 期待: 接続成功メッセージ
+
+# アプリケーション健全性確認
+curl http://localhost:8080/health
+# 期待: {"status": "healthy"} または 200 OK
+```
+
+#### Test 4: 統合動作テスト
+
+```bash
+# メトリクスエンドポイント確認
+curl http://localhost:8080/metrics | grep zaim_
+# 期待: Prometheus メトリクスが出力される
+
+# Redis にデータが保存されているか確認
+docker-compose exec redis sh -c 'redis-cli -a $(cat /run/secrets/redis_password) KEYS "*"'
+# 期待: セッションキーなどが存在
+```
+
 ## トラブルシューティング
 
 ### 1. OAuth 認証が失敗する
@@ -746,6 +837,63 @@ docker exec -it zaim-exporter ls -la /data
 
 # パーミッション確認
 docker exec -it zaim-exporter cat /data/oauth_tokens.json
+```
+
+### Q1: "undefined: strings" エラーが出る
+
+**A**: `cmd/exporter/main.go` の import リストに `"strings"` を追加してください。
+
+```go
+import (
+    // ...
+    "strings"  // ← この行を追加
+    // ...
+)
+```
+
+### Q2: Redis ヘルスチェックが常に unhealthy
+
+**A**: healthcheck コマンドがパスワード認証していません。
+
+```yaml
+# 修正前
+healthcheck:
+  test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+
+# 修正後
+healthcheck:
+  test: ["CMD", "sh", "-c", "redis-cli -a $$(cat /run/secrets/redis_password) --raw incr ping"]
+```
+
+### Q3: zaim-exporter が "NOAUTH" エラーで起動しない
+
+**A**: REDIS_URL がシェル展開されていません。コンポーネントベースの設定に変更してください。
+
+```yaml
+# 修正前
+environment:
+  - REDIS_URL=redis://:$(cat /run/secrets/redis_password)@redis:6379/0
+
+# 修正後
+environment:
+  - REDIS_HOST=redis
+  - REDIS_PORT=6379
+  - REDIS_DB=0
+  # REDIS_PASSWORD は /run/secrets/redis_password から自動読み込み
+  # Go コードで REDIS_URL を構築
+```
+
+### Q4: Docker secrets が読み込めない
+
+**A**: Secrets が正しく作成されているか確認してください。
+
+```bash
+# Secrets 確認
+docker secret ls
+
+# Secrets 作成（存在しない場合）
+echo "your_password" | docker secret create redis_password -
+echo "your_key" | docker secret create encryption_key -
 ```
 
 ## パフォーマンスチューニング
