@@ -1,0 +1,134 @@
+version: '3.9'
+
+services:
+  # ========================================
+  # Redis (Request Token Storage)
+  # ========================================
+  redis:
+    image: redis:7-alpine
+    container_name: zaim-redis
+    restart: unless-stopped
+    secrets:
+      - redis_password
+    command: sh -c 'redis-server --requirepass "$$(cat /run/secrets/redis_password)"'
+
+    volumes:
+      - redis-data:/data
+
+    networks:
+      - internal
+
+    # Health check with Docker Secrets
+    healthcheck:
+      test: ["CMD", "sh", "-c", "redis-cli -a $$(cat /run/secrets/redis_password) --raw incr ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ========================================
+  # Zaim Prometheus Exporter
+  # ========================================
+  zaim-exporter:
+    build: .
+    image: zaim-exporter:latest
+    container_name: zaim-exporter
+    restart: unless-stopped
+    secrets:
+      - encryption_key
+      - redis_password
+
+    environment:
+      # Zaim OAuth credentials (set in .env file)
+      - ZAIM_CONSUMER_KEY=${ZAIM_CONSUMER_KEY}
+      - ZAIM_CONSUMER_SECRET=${ZAIM_CONSUMER_SECRET}
+      - ZAIM_CALLBACK_URL=${ZAIM_CALLBACK_URL:-http://localhost:8080/zaim/auth/callback}
+
+      # Redis components (REDIS_URL auto-constructed by Go code)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      # REDIS_PASSWORD automatically read from /run/secrets/redis_password
+      # ENCRYPTION_KEY automatically read from /run/secrets/encryption_key
+
+      # Application settings
+      - PORT=8080
+      - TOKEN_FILE=/data/oauth_tokens.json
+      - TZ=Asia/Tokyo
+
+    volumes:
+      - zaim-tokens:/data
+
+    networks:
+      - internal
+      - external
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    ports:
+      - "8080:8080"
+
+    # Labels for Traefik (if using)
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.zaim-exporter.rule=Host(`zaim.${DOMAIN:-localhost}`)"
+      - "traefik.http.routers.zaim-exporter.entrypoints=websecure"
+      - "traefik.http.routers.zaim-exporter.tls.certresolver=letsencrypt"
+      - "traefik.http.services.zaim-exporter.loadbalancer.server.port=8080"
+
+  # ========================================
+  # Prometheus (Optional - for testing)
+  # ========================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+    networks:
+      - internal
+      - external
+
+    ports:
+      - "9090:9090"
+
+    depends_on:
+      - zaim-exporter
+
+# ========================================
+# Volumes
+# ========================================
+volumes:
+  zaim-tokens:
+    driver: local
+  redis-data:
+    driver: local
+  prometheus-data:
+    driver: local
+
+# ========================================
+# Networks
+# ========================================
+networks:
+  internal:
+    internal: true  # Internal communication only
+  external:
+    driver: bridge  # External access
+
+# ========================================
+# Secrets
+# ========================================
+secrets:
+  encryption_key:
+    file: ./secrets/encryption_key.txt
+  redis_password:
+    file: ./secrets/redis_password.txt
