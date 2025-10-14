@@ -1025,20 +1025,44 @@ type Config struct {
     CallbackURL    string
     TokenFile      string
     EncryptionKey  string
-    RedisURL       string
-    Port           int
+
+    // Redis configuration components
+    RedisHost     string
+    RedisPort     int
+    RedisPassword string
+    RedisDB       int
+    RedisURL      string  // Constructed or explicitly provided
+
+    Port          int
 }
 
 func loadConfig() *Config {
-    return &Config{
+    cfg := &Config{
         ConsumerKey:    getEnv("ZAIM_CONSUMER_KEY", ""),
         ConsumerSecret: getEnv("ZAIM_CONSUMER_SECRET", ""),
         CallbackURL:    getEnv("ZAIM_CALLBACK_URL", "http://localhost:8080/zaim/auth/callback"),
         TokenFile:      getEnv("TOKEN_FILE", "/data/oauth_tokens.json"),
         EncryptionKey:  getSecretOrEnv("ENCRYPTION_KEY", ""),
-        RedisURL:       getEnv("REDIS_URL", ""),
-        Port:           getEnvInt("PORT", 8080),
+
+        // Redis components (password auto-loaded from secrets)
+        RedisHost:     getEnv("REDIS_HOST", "redis"),
+        RedisPort:     getEnvInt("REDIS_PORT", 6379),
+        RedisPassword: getSecretOrEnv("REDIS_PASSWORD", ""),
+        RedisDB:       getEnvInt("REDIS_DB", 0),
+
+        Port:          getEnvInt("PORT", 8080),
     }
+
+    // REDIS_URL priority:
+    // 1. Explicit REDIS_URL environment variable (if provided)
+    // 2. Constructed from components
+    if redisURL := getEnv("REDIS_URL", ""); redisURL != "" {
+        cfg.RedisURL = redisURL
+    } else if cfg.RedisHost != "" {
+        cfg.RedisURL = buildRedisURL(cfg.RedisHost, cfg.RedisPort, cfg.RedisPassword, cfg.RedisDB)
+    }
+
+    return cfg
 }
 
 // getSecretOrEnv: Docker Secrets (/run/secrets/) を優先、次に環境変数を確認
@@ -1069,6 +1093,14 @@ func getEnvInt(key string, fallback int) int {
         return i
     }
     return fallback
+}
+
+// buildRedisURL constructs Redis connection string from components
+func buildRedisURL(host string, port int, password string, db int) string {
+    if password != "" {
+        return fmt.Sprintf("redis://:%s@%s:%d/%d", password, host, port, db)
+    }
+    return fmt.Sprintf("redis://%s:%d/%d", host, port, db)
 }
 ```
 
