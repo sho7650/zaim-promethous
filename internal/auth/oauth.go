@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
+	"path/filepath"
 	"sync"
 
 	"github.com/dghubble/oauth1"
@@ -104,10 +104,12 @@ func (s *FileTokenStorage) Save(tokens *OAuthTokens) error {
 		}
 	}
 
-	// Ensure directory exists
-	dir := strings.TrimSuffix(s.filepath, "/"+strings.Split(s.filepath, "/")[len(strings.Split(s.filepath, "/"))-1])
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+	// Ensure directory exists (skip if current directory)
+	dir := filepath.Dir(s.filepath)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
 	}
 
 	return os.WriteFile(s.filepath, data, 0600)
