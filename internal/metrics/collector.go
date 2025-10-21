@@ -11,7 +11,7 @@ import (
 )
 
 type ZaimCollector struct {
-	client        *zaim.Client
+	client        zaim.TransactionFetcher
 	aggregator    *Aggregator
 	logger        *zap.Logger
 	mu            sync.RWMutex
@@ -24,7 +24,7 @@ type metricsCache struct {
 	timestamp time.Time
 }
 
-func NewZaimCollector(client *zaim.Client, aggregator *Aggregator, logger *zap.Logger) *ZaimCollector {
+func NewZaimCollector(client zaim.TransactionFetcher, aggregator *Aggregator, logger *zap.Logger) *ZaimCollector {
 	return &ZaimCollector{
 		client:        client,
 		aggregator:    aggregator,

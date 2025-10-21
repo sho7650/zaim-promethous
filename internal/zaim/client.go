@@ -15,10 +15,19 @@ const (
 	baseURL = "https://api.zaim.net/v2/home"
 )
 
+// TransactionFetcher は取引データ取得の抽象化インターフェース
+// テスタビリティのため、具体的な実装（Client）から分離
+type TransactionFetcher interface {
+	GetCurrentMonthTransactions(ctx context.Context) ([]Transaction, error)
+}
+
 type Client struct {
 	httpClient *http.Client
 	logger     *zap.Logger
 }
+
+// Client が TransactionFetcher を実装していることをコンパイル時に保証
+var _ TransactionFetcher = (*Client)(nil)
 
 func NewClient(config *oauth1.Config, token *oauth1.Token, logger *zap.Logger) *Client {
 	httpClient := config.Client(context.Background(), token)
